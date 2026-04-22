@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -Wall -Wextra -pedantic -fPIC -pthread
+CXXFLAGS = -Wall -Wextra -pedantic -fPIC -pthread -std=c++11
 LDFLAGS = -shared
 INSTALL_DIR = /usr/local/lib
 
