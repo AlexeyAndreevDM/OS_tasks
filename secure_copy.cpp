@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -15,34 +16,87 @@
 
 static volatile sig_atomic_t keep_running = 1;  // Глобальный флаг остановки по SIGINT
 
-static pthread_mutex_t g_log_mutex;    // Защита общего лог-файла
-static pthread_mutex_t g_stats_mutex;  // Защита общей статистики
+static pthread_mutex_t g_log_mutex;  // Защита общего лог-файла
 static FILE* g_log_file = nullptr;
 
-struct GlobalStats {
+#ifndef WORKERS_COUNT
+#define WORKERS_COUNT 4
+#endif
+
+enum class Mode {
+    Sequential,
+    Parallel,
+    Auto
+};
+
+// Статистика одного запуска в конкретном режиме
+
+struct RunStats {
     size_t total_files;
     size_t completed;
     size_t failed;
     size_t interrupted;
     size_t bytes_written;
+    double total_ms;
+    double avg_ms;
 };
 
-static GlobalStats g_stats = {0, 0, 0, 0, 0};
+struct DataBlock {
+    std::vector<unsigned char> bytes;
+};
+
+struct PipelineState {
+    FILE* input_file;
+    FILE* output_file;
+    std::queue<DataBlock> blocks;  // Очередь обмена producer -> consumer
+    size_t max_blocks;             // Ограничение размера очереди (чтобы не копить весь файл в памяти)
+    bool producer_done;
+    bool has_error;
+    std::string error_message;
+    size_t bytes_written;
+    pthread_mutex_t mutex;
+    pthread_cond_t can_produce;
+    pthread_cond_t can_consume;
+};
+
+struct WorkerTask {
+    std::string input_path;
+    std::string output_path;
+    int status;
+    size_t written_bytes;
+    double duration_ms;
+};
+
+struct ParallelContext {
+    std::vector<WorkerTask>* tasks;
+    size_t next_index;          // Индекс следующей необработанной задачи
+    bool ready;                 // Главный поток разрешил worker-потокам старт
+    pthread_mutex_t queue_mutex;
+    pthread_cond_t queue_cv;
+    pthread_mutex_t stats_mutex;
+    RunStats stats;
+};
 
 static void handle_sigint(int) {
     keep_running = 0;  // ставим флаг на 0 чтоб потоки завершились сами, увидев флаг
 }
 
+static double now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 + static_cast<double>(ts.tv_nsec) / 1000000.0;
+}
+
 // Таймаутный захват мьютекса: помогает не висеть бесконечно при взаимоблокировке
 static bool lock_with_timeout(pthread_mutex_t* mutex, int timeout_ms) {
-    const int step_ms = 5; // раз в 5 мс пробуем захватить мьютекс
-    int waited_ms = 0; // сколько мс уже ждем
+    const int step_ms = 5;  // раз в 5 мс пробуем захватить мьютекс
+    int waited_ms = 0;      // сколько мс уже ждем
     while (waited_ms < timeout_ms) {
         int rc = pthread_mutex_trylock(mutex);
         if (rc == 0) {
             return true;
         }
-        if (rc != EBUSY) { // Ошибка, отличная от "занят"
+        if (rc != EBUSY) {  // Ошибка, отличная от "занят"
             return false;
         }
         usleep(step_ms * 1000);
@@ -71,24 +125,6 @@ static void log_line(const std::string& line) {
     fflush(g_log_file);
     pthread_mutex_unlock(&g_log_mutex);
 }
-
-struct DataBlock {
-    std::vector<unsigned char> bytes;
-};
-
-struct PipelineState {
-    FILE* input_file;
-    FILE* output_file;
-    std::queue<DataBlock> blocks;  // Очередь обмена producer -> consumer
-    size_t max_blocks;             // Ограничение размера очереди (чтобы не копить весь файл в памяти)
-    bool producer_done;
-    bool has_error;
-    std::string error_message;
-    size_t bytes_written;
-    pthread_mutex_t mutex;
-    pthread_cond_t can_produce;
-    pthread_cond_t can_consume;
-};
 
 static void set_pipeline_error(PipelineState* state, const char* message) {
     state->has_error = true;
@@ -209,7 +245,6 @@ static bool parse_key(const char* key_arg, char* out_key) {
 static int process_one_file(const std::string& input_path, const std::string& output_path, size_t* written_bytes) {
     FILE* input_file = fopen(input_path.c_str(), "rb");
     if (!input_file) {
-        // Входной файл недоступен: задачу считаем неуспешной
         return 1;
     }
 
@@ -276,32 +311,82 @@ static int process_one_file(const std::string& input_path, const std::string& ou
     return 0;
 }
 
-struct WorkerTask {
-    std::string input_path;
-    std::string output_path;
-    int status;
-    size_t written_bytes;
-};
+static const char* mode_name(Mode mode) {
+    if (mode == Mode::Sequential) {
+        return "sequential";
+    }
+    if (mode == Mode::Parallel) {
+        return "parallel";
+    }
+    return "auto";
+}
 
-static void* file_worker_thread(void* arg) {
-    WorkerTask* task = static_cast<WorkerTask*>(arg);
+static bool parse_mode(const char* arg, Mode* out_mode) {
+    const char* prefix = "--mode=";
+    if (strncmp(arg, prefix, strlen(prefix)) != 0) {
+        return false;
+    }
+
+    const char* value = arg + strlen(prefix);
+    if (strcmp(value, "sequential") == 0) {
+        *out_mode = Mode::Sequential;
+        return true;
+    }
+    if (strcmp(value, "parallel") == 0) {
+        *out_mode = Mode::Parallel;
+        return true;
+    }
+    if (strcmp(value, "auto") == 0) {
+        *out_mode = Mode::Auto;
+        return true;
+    }
+    return false;
+}
+
+static Mode choose_auto_mode(size_t files_count) {
+    // Эвристика из задания 4: <5 -> sequential, >=5 -> parallel
+    return (files_count < 5) ? Mode::Sequential : Mode::Parallel;
+}
+
+static void init_stats(RunStats* stats, size_t total_files) {
+    stats->total_files = total_files;
+    stats->completed = 0;
+    stats->failed = 0;
+    stats->interrupted = 0;
+    stats->bytes_written = 0;
+    stats->total_ms = 0.0;
+    stats->avg_ms = 0.0;
+}
+
+static void accumulate_task_result(RunStats* stats, const WorkerTask& task) {
+    if (task.status == 0) {
+        stats->completed++;
+        stats->bytes_written += task.written_bytes;
+    } else if (task.status == 130) {
+        stats->interrupted++;
+    } else {
+        stats->failed++;
+    }
+}
+
+static void finalize_avg(RunStats* stats, const std::vector<WorkerTask>& tasks) {
+    size_t measured = 0;
+    double sum_ms = 0.0;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (tasks[i].duration_ms > 0.0) {
+            measured++;
+            sum_ms += tasks[i].duration_ms;
+        }
+    }
+    stats->avg_ms = (measured == 0) ? 0.0 : (sum_ms / static_cast<double>(measured));
+}
+
+static void process_task(WorkerTask* task) {
     log_line("Старт: " + task->input_path + " -> " + task->output_path);
 
+    const double started_ms = now_ms();
     task->status = process_one_file(task->input_path, task->output_path, &task->written_bytes);  // Один worker обрабатывает одну пару in/out
-
-    if (lock_with_timeout(&g_stats_mutex, 300)) {
-        if (task->status == 0) {
-            g_stats.completed++;
-            g_stats.bytes_written += task->written_bytes;
-        } else if (task->status == 130) {
-            g_stats.interrupted++;
-        } else {
-            g_stats.failed++;
-        }
-        pthread_mutex_unlock(&g_stats_mutex);
-    } else {
-        fprintf(stderr, "[WARN] Таймаут захвата stats_mutex\n");
-    }
+    task->duration_ms = now_ms() - started_ms;
 
     if (task->status == 0) {
         log_line("Готово: " + task->output_path);
@@ -310,13 +395,152 @@ static void* file_worker_thread(void* arg) {
     } else {
         log_line("Ошибка: " + task->output_path);
     }
+}
+
+static void* pool_worker_thread(void* arg) {
+    ParallelContext* context = static_cast<ParallelContext*>(arg);
+
+    while (keep_running) {
+        size_t task_index = 0;
+
+        pthread_mutex_lock(&context->queue_mutex);
+        while (keep_running && !context->ready) {
+            pthread_cond_wait(&context->queue_cv, &context->queue_mutex);
+        }
+
+        if (!keep_running || context->next_index >= context->tasks->size()) {
+            // Либо пришел SIGINT, либо очередь задач полностью разобрана
+            pthread_mutex_unlock(&context->queue_mutex);
+            break;
+        }
+
+        task_index = context->next_index;
+        context->next_index++;
+        pthread_mutex_unlock(&context->queue_mutex);
+
+        WorkerTask& task = (*context->tasks)[task_index];
+        process_task(&task);
+
+        pthread_mutex_lock(&context->stats_mutex);
+        accumulate_task_result(&context->stats, task);
+        pthread_mutex_unlock(&context->stats_mutex);
+    }
 
     return nullptr;
 }
 
+static RunStats run_sequential(std::vector<WorkerTask>* tasks) {
+    RunStats stats;
+    init_stats(&stats, tasks->size());
+
+    const double started_ms = now_ms();
+    for (size_t i = 0; i < tasks->size(); ++i) {
+        if (!keep_running) {
+            break;
+        }
+        process_task(&(*tasks)[i]);
+        accumulate_task_result(&stats, (*tasks)[i]);
+    }
+    stats.total_ms = now_ms() - started_ms;
+    finalize_avg(&stats, *tasks);
+    return stats;
+}
+
+static RunStats run_parallel(std::vector<WorkerTask>* tasks) {
+    RunStats stats;
+    init_stats(&stats, tasks->size());
+
+    ParallelContext context;
+    context.tasks = tasks;
+    context.next_index = 0;
+    context.ready = false;
+    context.stats = stats;
+
+    pthread_mutex_init(&context.queue_mutex, nullptr);
+    pthread_cond_init(&context.queue_cv, nullptr);
+    pthread_mutex_init(&context.stats_mutex, nullptr);
+
+    // Пул ограничен WORKERS_COUNT: не создаем поток на каждый файл
+    const size_t workers_to_start = std::min(static_cast<size_t>(WORKERS_COUNT), tasks->size());
+    std::vector<pthread_t> workers(workers_to_start);
+    std::vector<bool> created(workers_to_start, false);
+
+    const double started_ms = now_ms();
+
+    for (size_t i = 0; i < workers_to_start; ++i) {
+        if (pthread_create(&workers[i], nullptr, pool_worker_thread, &context) == 0) {
+            created[i] = true;
+        } else {
+            log_line("Ошибка создания worker-потока пула");
+        }
+    }
+
+    pthread_mutex_lock(&context.queue_mutex);
+    context.ready = true;
+    pthread_cond_broadcast(&context.queue_cv);
+    pthread_mutex_unlock(&context.queue_mutex);
+
+    for (size_t i = 0; i < workers_to_start; ++i) {
+        if (created[i]) {
+            pthread_join(workers[i], nullptr);
+        }
+    }
+
+    context.stats.total_ms = now_ms() - started_ms;
+    finalize_avg(&context.stats, *tasks);
+
+    pthread_mutex_destroy(&context.queue_mutex);
+    pthread_cond_destroy(&context.queue_cv);
+    pthread_mutex_destroy(&context.stats_mutex);
+
+    return context.stats;
+}
+
+static RunStats run_mode(Mode mode, std::vector<WorkerTask>* tasks) {
+    if (mode == Mode::Sequential) {
+        return run_sequential(tasks);
+    }
+    return run_parallel(tasks);
+}
+
+static std::vector<WorkerTask> clone_tasks_blueprint(const std::vector<WorkerTask>& blueprint) {
+    std::vector<WorkerTask> copy = blueprint;
+    for (size_t i = 0; i < copy.size(); ++i) {
+        copy[i].status = 1;
+        copy[i].written_bytes = 0;
+        copy[i].duration_ms = 0.0;
+    }
+    return copy;
+}
+
+static void print_stats(const RunStats& stats, Mode mode) {
+    printf("Режим: %s\n", mode_name(mode));
+    printf("Файлов всего: %zu\n", stats.total_files);
+    printf("Успешно: %zu\n", stats.completed);
+    printf("С ошибкой: %zu\n", stats.failed);
+    printf("Прервано: %zu\n", stats.interrupted);
+    printf("Записано байт: %zu\n", stats.bytes_written);
+    printf("Общее время: %.3f ms\n", stats.total_ms);
+    printf("Среднее время на файл: %.3f ms\n", stats.avg_ms);
+}
+
+static void print_comparison(const RunStats& chosen, Mode chosen_mode, const RunStats& alternative, Mode alternative_mode) {
+    printf("\nСравнение режимов:\n");
+    printf("Выбранный (%s): %.3f ms\n", mode_name(chosen_mode), chosen.total_ms);
+    printf("Альтернативный (%s): %.3f ms\n", mode_name(alternative_mode), alternative.total_ms);
+
+    const double delta = alternative.total_ms - chosen.total_ms;
+    if (delta > 0.0) {
+        printf("Выбранный режим быстрее на %.3f ms\n", delta);
+    } else if (delta < 0.0) {
+        printf("Альтернативный режим быстрее на %.3f ms\n", -delta);
+    } else {
+        printf("Оба режима показали одинаковое время\n");
+    }
+}
+
 static void print_usage(const char* prog) {
-    fprintf(stderr, "Одиночный режим: %s <входной_файл> <выходной_файл> <ключ>\n", prog);
-    fprintf(stderr, "Многопоточный режим: %s <ключ> <in1> <out1> <in2> <out2> ...\n", prog);
+    fprintf(stderr, "Использование: %s [--mode=sequential|parallel|auto] <ключ> <in1> <out1> [<in2> <out2> ...]\n", prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -327,86 +551,68 @@ int main(int argc, char* argv[]) {
     sigaction(SIGINT, &sa, nullptr);
 
     char key = 0;
-    std::vector<WorkerTask> tasks;
+    std::vector<WorkerTask> blueprint_tasks;
+    Mode requested_mode = Mode::Auto;
+    int cursor = 1;
 
-    if (argc == 4) {  // Режим совместимости: один файл
-        if (!parse_key(argv[3], &key)) {
-            fprintf(stderr, "Ошибка: ключ должен быть 1 символом или числом 0..255\n");
+    if (cursor < argc && strncmp(argv[cursor], "--mode=", 7) == 0) {
+        if (!parse_mode(argv[cursor], &requested_mode)) {
+            fprintf(stderr, "Ошибка: поддерживаются --mode=sequential|parallel|auto\n");
             return 1;
         }
-        WorkerTask task;
-        task.input_path = argv[1];
-        task.output_path = argv[2];
-        task.status = 1;
-        task.written_bytes = 0;
-        tasks.push_back(task);
-    } else if (argc >= 6 && (argc % 2 == 0)) {  // Расширенный режим: несколько файлов
-        // Формат: secure_copy <key> <in1> <out1> <in2> <out2> ...
-        if (!parse_key(argv[1], &key)) {
-            fprintf(stderr, "Ошибка: ключ должен быть 1 символом или числом 0..255\n");
-            return 1;
-        }
-        for (int i = 2; i < argc; i += 2) {
-            WorkerTask task;
-            task.input_path = argv[i];
-            task.output_path = argv[i + 1];
-            task.status = 1;
-            task.written_bytes = 0;
-            tasks.push_back(task);
-        }
-    } else {
+        cursor++;
+    }
+
+    const int remaining = argc - cursor;
+    if (remaining < 3 || ((remaining - 1) % 2 != 0)) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (!parse_key(argv[cursor], &key)) {
+        fprintf(stderr, "Ошибка: ключ должен быть 1 символом или числом 0..255\n");
+        return 1;
+    }
+    cursor++;
+
+    for (int i = cursor; i < argc; i += 2) {
+        WorkerTask task;
+        task.input_path = argv[i];
+        task.output_path = argv[i + 1];
+        task.status = 1;
+        task.written_bytes = 0;
+        task.duration_ms = 0.0;
+        blueprint_tasks.push_back(task);
     }
 
     set_key(key);  // Один ключ применяется ко всем файлам текущего запуска
 
     pthread_mutex_init(&g_log_mutex, nullptr);
-    pthread_mutex_init(&g_stats_mutex, nullptr);
     g_log_file = fopen("secure_copy.log", "a");
 
-    g_stats.total_files = tasks.size();
-    g_stats.completed = 0;
-    g_stats.failed = 0;
-    g_stats.interrupted = 0;
-    g_stats.bytes_written = 0;
-    // Общая статистика по всем worker-потокам
-
-    log_line("Запуск secure_copy");
-
-    std::vector<pthread_t> workers(tasks.size());  // По одному worker-потоку на файл (параллельная обработка)
-    std::vector<bool> worker_created(tasks.size(), false);
-
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        if (pthread_create(&workers[i], nullptr, file_worker_thread, &tasks[i]) == 0) {
-            worker_created[i] = true;
-        } else {
-            tasks[i].status = 1;
-            // При ошибке старта потока учитываем задачу как failed
-            if (lock_with_timeout(&g_stats_mutex, 300)) {
-                g_stats.failed++;
-                pthread_mutex_unlock(&g_stats_mutex);
-            }
-            log_line("Ошибка создания потока задачи");
-        }
+    Mode effective_mode = requested_mode;
+    if (effective_mode == Mode::Auto) {
+        effective_mode = choose_auto_mode(blueprint_tasks.size());
     }
 
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        if (worker_created[i]) {
-            pthread_join(workers[i], nullptr);  // Корректное завершение всех потоков
-        }
+    log_line(std::string("Запуск secure_copy, режим=") + mode_name(effective_mode));
+
+    std::vector<WorkerTask> chosen_tasks = clone_tasks_blueprint(blueprint_tasks);
+    RunStats chosen_stats = run_mode(effective_mode, &chosen_tasks);
+
+    print_stats(chosen_stats, effective_mode);
+
+    if (requested_mode == Mode::Auto && keep_running) {
+        // В auto-режиме дополнительно считаем альтернативный режим для сравнения
+        Mode alternative_mode = (effective_mode == Mode::Sequential) ? Mode::Parallel : Mode::Sequential;
+        std::vector<WorkerTask> alternative_tasks = clone_tasks_blueprint(blueprint_tasks);
+        RunStats alternative_stats = run_mode(alternative_mode, &alternative_tasks);
+        print_comparison(chosen_stats, effective_mode, alternative_stats, alternative_mode);
     }
-    // Здесь все worker-потоки уже завершены
 
     if (!keep_running) {
         printf("Операция прервана пользователем\n");
     }
-
-    printf("Файлов всего: %zu\n", g_stats.total_files);
-    printf("Успешно: %zu\n", g_stats.completed);
-    printf("С ошибкой: %zu\n", g_stats.failed);
-    printf("Прервано: %zu\n", g_stats.interrupted);
-    printf("Записано байт: %zu\n", g_stats.bytes_written);
 
     log_line("Завершение secure_copy");
 
@@ -415,11 +621,9 @@ int main(int argc, char* argv[]) {
         g_log_file = nullptr;
     }
     pthread_mutex_destroy(&g_log_mutex);
-    pthread_mutex_destroy(&g_stats_mutex);
 
     if (!keep_running) {
-        // Возвращаем стандартный код прерывания по Ctrl+C
         return 130;
     }
-    return (g_stats.failed == 0) ? 0 : 1;  // 0 если нет ошибок, иначе 1
+    return (chosen_stats.failed == 0) ? 0 : 1;
 }
