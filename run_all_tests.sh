@@ -68,70 +68,42 @@ else
   fail "Сборка secure_copy успешна"
 fi
 
-# 3) Sequential
-./secure_copy --mode=sequential X \
-  "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_seq_1.enc" \
-  "$TEST_DIR/in_text_2.txt" "$TEST_DIR/out_seq_2.enc" \
-  > "$TEST_DIR/run_seq.log"
+# 3) Одиночный режим
+./secure_copy "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_single_1.enc" X \
+  > "$TEST_DIR/run_single.log"
 
-check_contains "$TEST_DIR/run_seq.log" "Режим: sequential" "Режим sequential выводится"
-check_contains "$TEST_DIR/run_seq.log" "Успешно: 2" "Sequential обработал 2/2"
-check_contains "$TEST_DIR/run_seq.log" "Общее время:" "Sequential выводит общее время"
-check_contains "$TEST_DIR/run_seq.log" "Среднее время на файл:" "Sequential выводит среднее время"
+check_contains "$TEST_DIR/run_single.log" "Файлов всего: 1" "Одиночный режим обработал 1 файл"
+check_contains "$TEST_DIR/run_single.log" "Успешно: 1" "Одиночный режим завершился успешно"
 
-# 4) Parallel
-./secure_copy --mode=parallel X \
-  "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_par_1.enc" \
-  "$TEST_DIR/in_text_2.txt" "$TEST_DIR/out_par_2.enc" \
-  > "$TEST_DIR/run_par.log"
+# 4) Многопоточный режим (ключ первым аргументом)
+./secure_copy X \
+  "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_multi_1.enc" \
+  "$TEST_DIR/in_text_2.txt" "$TEST_DIR/out_multi_2.enc" \
+  "$TEST_DIR/in_text_3.txt" "$TEST_DIR/out_multi_3.enc" \
+  "$TEST_DIR/in_text_4.txt" "$TEST_DIR/out_multi_4.enc" \
+  > "$TEST_DIR/run_multi.log"
 
-check_contains "$TEST_DIR/run_par.log" "Режим: parallel" "Режим parallel выводится"
-check_contains "$TEST_DIR/run_par.log" "Успешно: 2" "Parallel обработал 2/2"
-check_contains "$TEST_DIR/run_par.log" "Общее время:" "Parallel выводит общее время"
-check_contains "$TEST_DIR/run_par.log" "Среднее время на файл:" "Parallel выводит среднее время"
+check_contains "$TEST_DIR/run_multi.log" "Файлов всего: 4" "Многопоточный режим обработал 4 файла"
+check_contains "$TEST_DIR/run_multi.log" "Успешно: 4" "Многопоточный режим завершился успешно"
 
-# 5) Auto (малый набор < 5, должен выбрать sequential)
-./secure_copy --mode=auto X \
-  "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_auto_small_1.enc" \
-  "$TEST_DIR/in_text_2.txt" "$TEST_DIR/out_auto_small_2.enc" \
-  "$TEST_DIR/in_text_3.txt" "$TEST_DIR/out_auto_small_3.enc" \
-  "$TEST_DIR/in_text_4.txt" "$TEST_DIR/out_auto_small_4.enc" \
-  > "$TEST_DIR/run_auto_small.log"
-
-check_contains "$TEST_DIR/run_auto_small.log" "Режим: sequential" "Auto(<5) выбрал sequential"
-check_contains "$TEST_DIR/run_auto_small.log" "Сравнение режимов:" "Auto(<5) выводит сравнение режимов"
-
-# 6) Auto (большой набор >= 5, должен выбрать parallel)
-./secure_copy --mode=auto X \
-  "$TEST_DIR/in_text_1.txt" "$TEST_DIR/out_auto_1.enc" \
-  "$TEST_DIR/in_text_2.txt" "$TEST_DIR/out_auto_2.enc" \
-  "$TEST_DIR/in_text_3.txt" "$TEST_DIR/out_auto_3.enc" \
-  "$TEST_DIR/in_text_4.txt" "$TEST_DIR/out_auto_4.enc" \
-  "$TEST_DIR/in_text_5.txt" "$TEST_DIR/out_auto_5.enc" \
-  "$TEST_DIR/in_text_6.txt" "$TEST_DIR/out_auto_6.enc" \
-  "$TEST_DIR/in_text_7.txt" "$TEST_DIR/out_auto_7.enc" \
-  "$TEST_DIR/in_text_8.txt" "$TEST_DIR/out_auto_8.enc" \
-  "$TEST_DIR/in_bin_9.bin" "$TEST_DIR/out_auto_9.enc" \
-  "$TEST_DIR/in_bin_10.bin" "$TEST_DIR/out_auto_10.enc" \
-  > "$TEST_DIR/run_auto.log"
-
-check_contains "$TEST_DIR/run_auto.log" "Режим: parallel" "Auto(>=5) выбрал parallel"
-check_contains "$TEST_DIR/run_auto.log" "Файлов всего: 10" "Auto(>=5) обработал 10 файлов"
-check_contains "$TEST_DIR/run_auto.log" "Сравнение режимов:" "Auto(>=5) выводит сравнение режимов"
-
-# 7) XOR обратимость для бинарных файлов
-./secure_copy --mode=sequential X \
-  "$TEST_DIR/out_auto_9.enc" "$TEST_DIR/dec_auto_9.bin" \
-  "$TEST_DIR/out_auto_10.enc" "$TEST_DIR/dec_auto_10.bin" \
+# 5) XOR обратимость для бинарных файлов (многопоточно)
+./secure_copy X \
+  "$TEST_DIR/in_bin_9.bin" "$TEST_DIR/out_bin_9.enc" \
+  "$TEST_DIR/in_bin_10.bin" "$TEST_DIR/out_bin_10.enc" \
   > /dev/null
 
-if cmp -s "$TEST_DIR/in_bin_9.bin" "$TEST_DIR/dec_auto_9.bin"; then
+./secure_copy X \
+  "$TEST_DIR/out_bin_9.enc" "$TEST_DIR/dec_bin_9.bin" \
+  "$TEST_DIR/out_bin_10.enc" "$TEST_DIR/dec_bin_10.bin" \
+  > /dev/null
+
+if cmp -s "$TEST_DIR/in_bin_9.bin" "$TEST_DIR/dec_bin_9.bin"; then
   pass "Бинарный файл #9 восстановлен корректно"
 else
   fail "Бинарный файл #9 восстановлен корректно"
 fi
 
-if cmp -s "$TEST_DIR/in_bin_10.bin" "$TEST_DIR/dec_auto_10.bin"; then
+if cmp -s "$TEST_DIR/in_bin_10.bin" "$TEST_DIR/dec_bin_10.bin"; then
   pass "Бинарный файл #10 восстановлен корректно"
 else
   fail "Бинарный файл #10 восстановлен корректно"
@@ -150,17 +122,11 @@ fi
   echo "PASS: $pass_count"
   echo "FAIL: $fail_count"
   echo
-  echo "--- run_seq.log ---"
-  cat "$TEST_DIR/run_seq.log"
+  echo "--- run_single.log ---"
+  cat "$TEST_DIR/run_single.log"
   echo
-  echo "--- run_par.log ---"
-  cat "$TEST_DIR/run_par.log"
-  echo
-  echo "--- run_auto_small.log ---"
-  cat "$TEST_DIR/run_auto_small.log"
-  echo
-  echo "--- run_auto.log ---"
-  cat "$TEST_DIR/run_auto.log"
+  echo "--- run_multi.log ---"
+  cat "$TEST_DIR/run_multi.log"
   echo
   echo "--- tail secure_copy.log ---"
   tail -n 20 "$ROOT_DIR/secure_copy.log" || true
