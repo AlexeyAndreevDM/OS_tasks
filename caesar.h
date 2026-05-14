@@ -9,6 +9,7 @@ extern "C" {
 
 void set_key(char key); // Установка ключа
 void caesar(void* src, void* dst, int len); // XOR шифровка/дешифровка
+void clear_key(); // Безопасная очистка ключа
 
 #ifdef __cplusplus
 }
