@@ -1,426 +1,702 @@
+/**
+ * 4 байта - размер данных файлов
+ * 4 байта - размер имени
+ * 16 байт - соль
+ * N байт - имя файла
+ * M байт - зашифрованные данные файла
+ */
+
+
 #include <pthread.h>
-#include <signal.h>
-#include <unistd.h>
+#include <signal.h> // для обработки сигнала SIGSEGV при попытке доступа к странице ключа
+#include <unistd.h> // для sysconf и _exit, exit - для безопасного завершения процесса при нарушении доступа к ключу
 
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <queue>
-#include <string>
-#include <vector>
+#include <cstdint> // для uint32_t при работе с форматом образа, чтобы обеспечить переносимость и точное определение размера данных
+#include <cstdio> // для работы с файлами и потоками ввода-вывода
+#include <cstdlib> // для malloc, free и exit, malloc - для динамического выделения памяти при работе с файлами и буферами, динамическое выделение может потребоваться при работе с большими файлами или при чтении переменных по размеру данных из образа
+#include <cstring> // для memcpy и memset при работе с буферами и страницей ключа, memcpy - для копирования данных в выделенную страницу ключа, memset - для очистки страницы ключа при освобождении, чтобы предотвратить утечку данных
+#include <algorithm> // для std::sort при сортировке списка файлов в образе
+#include <string> // для удобной работы со строками при обработке имен файлов и путей
+#include <vector> // для хранения списка файлов при работе с образом
 
-#include "caesar.h"
+#include <dirent.h> // для работы с директориями при сборе файлов для образа, DIR, struct dirent и функции opendir, readdir, closedir - для обхода директорий и получения списка файлов для добавления в образ
+#include <sys/stat.h> // для получения информации о файлах при сборе файлов для образа, struct stat и функция stat - для получения размера файлов и проверки типа (файл или директория) при сборе файлов для образа
 
-static volatile sig_atomic_t keep_running = 1;  // Глобальный флаг остановки по SIGINT
+#include "caesar.h" // наша библиотека шифрования RC4
 
-static pthread_mutex_t g_log_mutex;    // Защита общего лог-файла
-static pthread_mutex_t g_stats_mutex;  // Защита общей статистики
-static FILE* g_log_file = nullptr;
+static void handle_sigsegv(int sig, siginfo_t* info, void*) { // вызывается при попытке доступа к странице ключа, чтобы предотвратить утечку ключа
+    if (info && is_key_page_address(info->si_addr)) {
+        // Явное нарушение доступа к странице ключа
+        const char message[] = "[SECURITY] Попытка доступа к защищенному ключу\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        _exit(1);
+    }
 
-struct GlobalStats {
-    size_t total_files;
-    size_t completed;
-    size_t failed;
-    size_t interrupted;
-    size_t bytes_written;
-};
-
-static GlobalStats g_stats = {0, 0, 0, 0, 0};
-
-static void handle_sigint(int) {
-    keep_running = 0;  // ставим флаг на 0 чтоб потоки завершились сами, увидев флаг
+    // Для остальных адресов возвращаем стандартное поведение
+    struct sigaction sa; // восстанавливаем стандартную обработку сигнала, чтобы не нарушать работу программы при других ошибках доступа к памяти
+    memset(&sa, 0, sizeof(sa)); // обнуляем структуру sigaction для корректной инициализации
+    sa.sa_handler = SIG_DFL; // устанавливаем обработчик по умолчанию для сигнала, чтобы при повторном возникновении сигнала программа завершилась стандартным образом
+    sigemptyset(&sa.sa_mask); // очищаем маску сигналов, чтобы не блокировать другие сигналы при обработке
+    sigaction(sig, &sa, nullptr); // восстанавливаем стандартную обработку сигнала
+    raise(sig); // повторно посылаем сигнал, чтобы программа завершилась стандартным образом при других ошибках доступа к памяти
 }
 
-// Таймаутный захват мьютекса: помогает не висеть бесконечно при взаимоблокировке
-static bool lock_with_timeout(pthread_mutex_t* mutex, int timeout_ms) {
-    const int step_ms = 5; // раз в 5 мс пробуем захватить мьютекс
-    int waited_ms = 0; // сколько мс уже ждем
-    while (waited_ms < timeout_ms) {
-        int rc = pthread_mutex_trylock(mutex);
-        if (rc == 0) {
-            return true;
+
+struct ImageEntry { // структура для хранения информации о файлах в образе, которая будет использоваться при чтении и записи образа, а также для сортировки файлов по имени
+    std::string name;
+    uint32_t size;
+};
+
+struct AddJob { // структура для хранения информации о файлах, которые нужно добавить в образ, используется при сборе файлов из директории и их последующей обработке для добавления в образ
+    std::string source_path;
+    std::string stored_name;
+};
+
+static bool write_u32_le(FILE* file, uint32_t value) { // вспомогательная функция для записи 32-битного числа в формате little-endian, которая используется при записи заголовков файлов в образ, чтобы обеспечить совместимость с форматом образа и корректное чтение при извлечении файлов из образа
+    unsigned char buf[4]; // буфер для хранения байтов числа, который будет записан в файл, использование буфера позволяет корректно формировать представление числа в нужном формате перед записью
+    buf[0] = static_cast<unsigned char>(value & 0xFFu); // записываем младший байт числа в первый элемент буфера
+    buf[1] = static_cast<unsigned char>((value >> 8) & 0xFFu);
+    buf[2] = static_cast<unsigned char>((value >> 16) & 0xFFu);
+    buf[3] = static_cast<unsigned char>((value >> 24) & 0xFFu);
+    return fwrite(buf, 1, sizeof(buf), file) == sizeof(buf); // записываем буфер в файл и проверяем, что запись прошла успешно, возвращаем true при успешной записи и false при ошибке
+}
+
+static bool read_u32_le(FILE* file, uint32_t* value, bool* eof) { // вспомогательная функция для чтения 32-битного числа в формате little-endian, которая используется при чтении заголовков файлов из образа
+    unsigned char buf[4]; // буфер для хранения байтов числа в формате little-endian, который будет прочитан из файла, использование буфера позволяет корректно формировать представление числа в нужном формате после чтения
+    size_t read_bytes = fread(buf, 1, sizeof(buf), file);
+    if (read_bytes == 0 && feof(file)) {
+        // Достигнут конец файла без ошибки чтения
+        *eof = true;
+        return false;
+    }
+    if (read_bytes != sizeof(buf)) {
+        // Поврежденный/неполный заголовок
+        *eof = false;
+        return false;
+    }
+
+    *eof = false;
+    *value = static_cast<uint32_t>(buf[0]) | // формируем число из байтов в формате little-endian, используя побитовые операции для корректного объединения байтов в 32-битное число
+             (static_cast<uint32_t>(buf[1]) << 8) |
+             (static_cast<uint32_t>(buf[2]) << 16) |
+             (static_cast<uint32_t>(buf[3]) << 24);
+    return true;
+}
+
+static bool read_exact(FILE* file, void* buffer, size_t len) {
+    // При неполном чтении считаем образ поврежденным
+    return fread(buffer, 1, len, file) == len;
+}
+
+static bool write_exact(FILE* file, const void* buffer, size_t len) {
+    // Любая недозапись критична для целостности образа
+    return fwrite(buffer, 1, len, file) == len;
+}
+
+static bool path_is_dir(const std::string& path) {
+    // Проверка, является ли путь директорией
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISDIR(st.st_mode);
+}
+
+static std::string trim_trailing_slashes(const std::string& path) {
+    // Нормализация пути для корректной обработки базового имени директории, удаляя лишние слэши в конце пути, чтобы избежать проблем при формировании относительных путей внутри образа
+    size_t end = path.size();
+    while (end > 1 && path[end - 1] == '/') {
+        --end; // уменьшаем индекс конца строки, пока не достигнем первого символа, который не является слэшем, или не останется один символ (для корневого пути "/")
+    }
+    return path.substr(0, end); // возвращаем подстроку от начала до найденного индекса, которая будет использоваться для получения базового имени директории и формирования относительных путей внутри образа
+}
+
+static std::string basename_of(const std::string& path) {
+    // Берем имя корневой директории для записи в образ
+    std::string clean = trim_trailing_slashes(path); // удаляем лишние слэши в конце пути, чтобы корректно получить базовое имя директории, особенно если путь заканчивается на слэш, что может привести к неправильному определению базового имени
+    size_t pos = clean.find_last_of('/'); // находим позицию последнего слэша в пути, чтобы отделить базовое имя от остальной части пути, если слэш не найден, то базовым именем будет весь путь
+    if (pos == std::string::npos) { // слэш не найден, возвращаем весь путь как базовое имя
+        return clean;
+    }
+    return clean.substr(pos + 1); // возращаем подстроку - базовое имя директориии
+}
+
+static bool collect_from_dir(const std::string& root, const std::string& base_name, const std::string& current, std::vector<AddJob>& jobs) {
+    // Рекурсивный сбор файлов с относительными путями внутри выбранной директории
+    DIR* dir = opendir(current.c_str());
+    if (!dir) {
+        // Нельзя открыть директорию для обхода
+        return false;
+    }
+
+    struct dirent* entry = nullptr; // структура для хранения информации о текущем файле или директории при обходе, которая будет использоваться для получения имен файлов и определения их типа (файл или директория) при сборе файлов для образа
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) { // пропускаем текущую и родительскую директории, чтобы избежать бесконечной рекурсии при обходе директорий
+            continue;
         }
-        if (rc != EBUSY) { // Ошибка, отличная от "занят"
+
+        std::string full_path = current + "/" + entry->d_name;
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0) {
+            // Ошибка - не удалось заполнить струтуру stat: прекращаем сбор, чтобы не пропустить файл
+            closedir(dir);
             return false;
         }
-        usleep(step_ms * 1000);
-        waited_ms += step_ms;
-    }
-    return false;
-}
 
-static void log_line(const std::string& line) {
-    if (g_log_file == nullptr) {
-        return;
-    }
-
-    if (!lock_with_timeout(&g_log_mutex, 300)) {
-        fprintf(stderr, "[WARN] Таймаут захвата log_mutex\n");
-        return;
-    }
-
-    time_t now = time(nullptr);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
-
-    fprintf(g_log_file, "[%s] %s\n", ts, line.c_str());  // Потокобезопасное логирование
-    fflush(g_log_file);
-    pthread_mutex_unlock(&g_log_mutex);
-}
-
-struct DataBlock {
-    std::vector<unsigned char> bytes;
-};
-
-struct PipelineState {
-    FILE* input_file;
-    FILE* output_file;
-    std::queue<DataBlock> blocks;  // Очередь обмена producer -> consumer
-    size_t max_blocks;             // Ограничение размера очереди (чтобы не копить весь файл в памяти)
-    bool producer_done;
-    bool has_error;
-    std::string error_message;
-    size_t bytes_written;
-    pthread_mutex_t mutex;
-    pthread_cond_t can_produce;
-    pthread_cond_t can_consume;
-};
-
-static void set_pipeline_error(PipelineState* state, const char* message) {
-    state->has_error = true;
-    state->error_message = message;
-    pthread_cond_broadcast(&state->can_produce);
-    pthread_cond_broadcast(&state->can_consume);
-}
-
-static void* producer_thread(void* arg) {
-    PipelineState* state = static_cast<PipelineState*>(arg);
-    unsigned char temp[4096];
-
-    while (keep_running) {
-        size_t bytes_read = fread(temp, 1, sizeof(temp), state->input_file);
-
-        if (bytes_read > 0) {
-            caesar(temp, temp, static_cast<int>(bytes_read));
-
-            DataBlock block;
-            block.bytes.assign(temp, temp + bytes_read);
-
-            pthread_mutex_lock(&state->mutex);
-            while (keep_running && !state->has_error && state->blocks.size() >= state->max_blocks) {
-                // Если очередь переполнена — producer ждет, пока consumer освободит место
-                pthread_cond_wait(&state->can_produce, &state->mutex);
+        if (S_ISDIR(st.st_mode)) { // если текущий элемент является директорией, рекурсивно вызываем функцию для сбора файлов внутри этой директории, передавая обновленный путь и базовое имя для формирования относительных путей внутри образа
+            if (!collect_from_dir(root, base_name, full_path, jobs)) {
+                // Прерываемся при ошибке в поддиректории
+                closedir(dir);
+                return false;
             }
-
-            if (!keep_running || state->has_error) {
-                pthread_mutex_unlock(&state->mutex);
-                break;
+        } else if (S_ISREG(st.st_mode)) { // если текущий элемент является обычным файлом, добавляем его в список заданий для добавления в образ, формируя относительный путь внутри образа на основе базового имени и пути к файлу относительно корневой директории
+            std::string relative = full_path.substr(root.size()); // формируем относительный путь внутри образа, удаляя корневой путь из полного пути к файлу, чтобы сохранить структуру директорий внутри образа и избежать дублирования корневого пути в именах файлов внутри образа
+            if (!relative.empty() && relative[0] == '/') {
+                relative.erase(0, 1);
             }
-
-            state->blocks.push(std::move(block));  // Кладем шифрованный блок в очередь
-            pthread_cond_signal(&state->can_consume);
-            pthread_mutex_unlock(&state->mutex);
-        }
-
-        if (bytes_read < sizeof(temp)) {
-            pthread_mutex_lock(&state->mutex);
-            if (ferror(state->input_file)) {
-                set_pipeline_error(state, "Ошибка чтения входного файла");
-            }
-            state->producer_done = true;
-            pthread_cond_broadcast(&state->can_consume);
-            pthread_mutex_unlock(&state->mutex);
-            break;
+            AddJob job;
+            job.source_path = full_path;
+            job.stored_name = base_name + "/" + relative;
+            jobs.push_back(job); // добавляем задание на добавление файла в образ в общий список заданий, который будет использоваться для обработки и добавления файлов в образ, обеспечивая сохранение структуры директорий внутри образа
         }
     }
 
-    pthread_mutex_lock(&state->mutex);
-    state->producer_done = true;
-    pthread_cond_broadcast(&state->can_consume);
-    pthread_mutex_unlock(&state->mutex);
-    return nullptr;
+    closedir(dir);
+    return true;
 }
 
-static void* consumer_thread(void* arg) {
-    PipelineState* state = static_cast<PipelineState*>(arg);
+
+static bool read_salt(unsigned char* salt, size_t len) {
+    // Соль генерируется для каждого файла отдельно
+    FILE* rnd = fopen("/dev/urandom", "rb");
+    if (!rnd) {
+        return false;
+    }
+    bool ok = fread(salt, 1, len, rnd) == len; // читаем случайные байты из /dev/urandom для использования в качестве соли при шифровании каждого файла, соль обеспечивает уникальность шифрования для каждого файла
+    fclose(rnd);
+    return ok;
+}
+
+struct AddContext {
+    // Контекст общего очередного списка заданий для потоков
+    std::vector<AddJob> jobs;
+    size_t next_index;
+    pthread_mutex_t jobs_mutex;
+    pthread_mutex_t image_mutex;
+    FILE* image_file;
+    std::string image_path;
+    int errors;
+    int skipped;
+};
+
+static int image_contains_name(const std::string& image_path, const std::string& target_name) {
+    // Проверка на дубликаты имен в образе
+    FILE* file = fopen(image_path.c_str(), "rb");
+    if (!file) {
+        return -1;
+    }
 
     while (true) {
-        pthread_mutex_lock(&state->mutex);
-
-        while (!state->has_error && keep_running && state->blocks.empty() && !state->producer_done) {
-            // Если данных пока нет — consumer ждет сигнал от producer
-            pthread_cond_wait(&state->can_consume, &state->mutex);
+        bool eof = false;
+        uint32_t file_len = 0; // читаем длину файла из заголовка образа, чтобы знать, сколько байт данных нужно пропустить после чтения имени и соли, если имя не совпало, для корректного обхода образа и проверки всех записей на наличие дубликатов имен
+        if (!read_u32_le(file, &file_len, &eof)) { // читаем длину файла из заголовка образа, если достигнут конец файла, то выходим из цикла, так как все записи были проверены, если произошла ошибка чтения, то считаем образ поврежденным и возвращаем ошибку
+            if (eof) {
+                break;
+            }
+            fclose(file);
+            return -1;
         }
 
-        if (state->has_error || (state->blocks.empty() && (!keep_running || state->producer_done))) {
-            pthread_mutex_unlock(&state->mutex);
+        uint32_t name_len = 0;
+        if (!read_u32_le(file, &name_len, &eof) || eof) { // читаем длину имени из заголовка образа, если достигнут конец файла, то считаем образ поврежденным, так как запись неполная, если произошла ошибка чтения, то также считаем образ поврежденным и возвращаем ошибку
+            fclose(file);
+            return -1;
+        }
+
+        unsigned char salt[16];
+        if (!read_exact(file, salt, sizeof(salt))) { // читаем соль из заголовка образа, если произошла ошибка чтения, то считаем образ поврежденным и возвращаем ошибку
+            fclose(file);
+            return -1;
+        }
+
+        if (name_len > 65535) { // проверяем, что длина имени не превышает разумные пределы, чтобы предотвратить попытки атак на образ с целью создания очень длинных имен, которые могут привести к проблемам с памятью при чтении, если имя слишком длинное, то считаем образ поврежденным и возвращаем ошибку
+            fclose(file);
+            return -1;
+        }
+
+        std::string name(name_len, '\0');
+        if (!read_exact(file, &name[0], name_len)) { // читаем имя файла из заголовка образа, если произошла ошибка чтения, то считаем образ поврежденным и возвращаем ошибку
+            fclose(file);
+            return -1;
+        }
+
+        if (name == target_name) { // если имя совпало с искомым, то закрываем файл и возвращаем 1, чтобы указать на наличие дубликата имени в образе
+            fclose(file);
+            return 1;
+        }
+
+        if (fseek(file, static_cast<long>(file_len), SEEK_CUR) != 0) { // пропускаем данные файла, если произошла ошибка при попытке пропустить данные, то считаем образ поврежденным и возвращаем ошибку, fseek - перестановка курсора в файле для пропуска данных, SEEK_CUR - относительно текущей позиции, static_cast<long> - приведение типа для корректной работы функции fseek с размером данных
+            fclose(file);
+            return -1;
+        }
+    }
+
+    fclose(file);
+    return 0;
+}
+
+static int append_record(FILE* image_file, const AddJob& job, uint32_t file_len, const unsigned char* salt, FILE* temp_file, AddContext* ctx) {
+    // Запись заголовка + зашифрованных данных файла в образ
+    uint32_t name_len = static_cast<uint32_t>(job.stored_name.size());
+
+    pthread_mutex_lock(&ctx->image_mutex);
+
+    int contains = image_contains_name(ctx->image_path, job.stored_name);
+    if (contains == 1) {
+        // Пропускаем дубликат имени
+        pthread_mutex_unlock(&ctx->image_mutex);
+        return 2;
+    }
+    if (contains == -1) {
+        // Ошибка чтения образа при проверке дубликатов
+        pthread_mutex_unlock(&ctx->image_mutex);
+        return 1;
+    }
+
+    if (!write_u32_le(image_file, file_len) || // записываем длину файла в заголовок образа, если произошла ошибка записи, то возвращаем ошибку, write_u32_le - вспомогательная функция для записи 32-битного числа в формате little-endian, которая используется для обеспечения совместимости с форматом образа и корректного чтения при извлечении файлов из образа
+        !write_u32_le(image_file, name_len) ||
+        !write_exact(image_file, salt, 16) ||
+        !write_exact(image_file, job.stored_name.data(), name_len)) {
+        // Не удалось записать заголовок записи
+        pthread_mutex_unlock(&ctx->image_mutex);
+        return 1;
+    }
+
+    unsigned char buffer[4096];
+    size_t read_bytes = 0;
+    while ((read_bytes = fread(buffer, 1, sizeof(buffer), temp_file)) > 0) {
+        if (fwrite(buffer, 1, read_bytes, image_file) != read_bytes) {
+            // Ошибка записи зашифрованных данных в образ
+            pthread_mutex_unlock(&ctx->image_mutex);
+            return 1;
+        }
+    }
+
+    if (ferror(temp_file)) {
+        // Временный файл поврежден или недочитан
+        pthread_mutex_unlock(&ctx->image_mutex);
+        return 1;
+    }
+
+    fflush(image_file); // гарантируем, что данные записаны на диск, чтобы предотвратить потерю данных при сбое после записи, fflush - сброс буфера вывода в файл, чтобы обеспечить сохранение данных на диске
+    pthread_mutex_unlock(&ctx->image_mutex);
+    return 0;
+}
+
+static int process_add_job(AddContext* ctx, const AddJob& job) { // обработка одного задания на добавление файла в образ - открываем файл и передаем его на шифрование в process_add_job, который шифрует файл во временный поток
+    // Шифруем файл во временный поток, затем добавляем в образ
+    struct stat st;
+    if (stat(job.source_path.c_str(), &st) != 0) {
+        // Пропускаем недоступный файл
+        return 1;
+    }
+
+    uint32_t file_len = static_cast<uint32_t>(st.st_size); // получаем размер файла для записи в заголовок образа, чтобы при извлечении файла из образа знать, сколько байт данных нужно прочитать для восстановления файла, static_cast<uint32_t> - приведение типа для обеспечения корректного представления размера файла в 32-битном формате, который используется в заголовке образа
+
+    FILE* input = fopen(job.source_path.c_str(), "rb");
+    if (!input) {
+        // Не удалось открыть входной файл
+        return 1;
+    }
+
+    FILE* temp_file = tmpfile();
+    if (!temp_file) {
+        // Нельзя создать временный файл для шифрования
+        fclose(input);
+        return 1;
+    }
+
+    unsigned char salt[16];
+    if (!read_salt(salt, sizeof(salt))) {
+        // Не удалось получить случайную соль
+        fclose(input);
+        fclose(temp_file);
+        return 1;
+    }
+
+    if (rc4_crypt_stream(input, temp_file, salt, sizeof(salt), file_len) != 0) {
+        // Ошибка шифрования потока
+        fclose(input);
+        fclose(temp_file);
+        return 1;
+    }
+
+    fclose(input);
+    fflush(temp_file); // гарантируем, что все данные записаны во временный файл, чтобы предотвратить проблемы при чтении данных для записи в образ, fflush - сброс буфера вывода в файл, чтобы обеспечить сохранение данных на диске
+    fseek(temp_file, 0, SEEK_SET);
+
+    int result = append_record(ctx->image_file, job, file_len, salt, temp_file, ctx);
+    fclose(temp_file);
+    return result;
+}
+
+static void* add_worker_thread(void* arg) {
+    // Поток-воркер для параллельного добавления файлов (до 5 штук)
+    AddContext* ctx = static_cast<AddContext*>(arg);
+
+    while (true) {
+        pthread_mutex_lock(&ctx->jobs_mutex);
+        if (ctx->next_index >= ctx->jobs.size()) {
+            // Все задания разобраны другими потоками
+            pthread_mutex_unlock(&ctx->jobs_mutex);
             break;
         }
+        AddJob job = ctx->jobs[ctx->next_index++];
+        pthread_mutex_unlock(&ctx->jobs_mutex);
 
-        DataBlock block = std::move(state->blocks.front());  // Берем следующий блок из очереди
-        state->blocks.pop();
-        pthread_cond_signal(&state->can_produce);
-        pthread_mutex_unlock(&state->mutex);
-
-        size_t to_write = block.bytes.size();
-        size_t total_written = 0;
-        while (total_written < to_write) {
-            size_t written = fwrite(block.bytes.data() + total_written, 1, to_write - total_written, state->output_file);
-            if (written == 0) {
-                pthread_mutex_lock(&state->mutex);
-                set_pipeline_error(state, "Ошибка записи выходного файла");
-                pthread_mutex_unlock(&state->mutex);
-                return nullptr;
-            }
-            total_written += written;
+        int result = process_add_job(ctx, job);
+        if (result == 1) {
+            // Счетчик ошибок нужен для итогового кода возврата
+            pthread_mutex_lock(&ctx->jobs_mutex);
+            ctx->errors++;
+            pthread_mutex_unlock(&ctx->jobs_mutex);
+        } else if (result == 2) {
+            // Дубликаты считаем пропущенными, не ошибкой
+            pthread_mutex_lock(&ctx->jobs_mutex);
+            ctx->skipped++;
+            pthread_mutex_unlock(&ctx->jobs_mutex);
         }
-        state->bytes_written += to_write;
     }
 
     return nullptr;
 }
 
-// Нужна для поддержки двух форм ключа: символ (X) и число (88)
-static bool parse_key(const char* key_arg, char* out_key) {
-    char* end = nullptr;
-    errno = 0;
-    long value = strtol(key_arg, &end, 10);
+static int add_to_image(const std::string& image_path, const std::string& master_key, const std::vector<std::string>& inputs) {
+    // Добавление файлов/директорий в образ с RC4 и индивидуальной солью
+    std::vector<AddJob> jobs;
 
-    if (errno == 0 && end != nullptr && *key_arg != '\0' && *end == '\0') {
-        if (value < 0 || value > 255) {
-            return false;
+    for (const auto& input : inputs) {
+        if (path_is_dir(input)) {
+            std::string root = trim_trailing_slashes(input);
+            std::string base_name = basename_of(root);
+            if (!collect_from_dir(root, base_name, root, jobs)) {
+                // Ошибка чтения директории — прекращаем добавление
+                return 1;
+            }
+        } else {
+            AddJob job;
+            job.source_path = input;
+            job.stored_name = input;
+            jobs.push_back(job);
         }
-        *out_key = static_cast<char>(static_cast<unsigned char>(value));
-        return true;
     }
 
-    if (strlen(key_arg) == 1) {
-        *out_key = key_arg[0];
-        return true;
+    if (jobs.empty()) {
+        // Нечего добавлять
+        return 1;
     }
 
-    return false;
+    if (set_master_key(reinterpret_cast<const unsigned char*>(master_key.data()), master_key.size()) != 0) {
+        // Некорректный мастер-ключ
+        return 1;
+    }
+
+    FILE* image_file = fopen(image_path.c_str(), "ab+");
+    if (!image_file) {
+        // Не удалось создать или открыть образ
+        return 1;
+    }
+
+    AddContext ctx;
+    ctx.jobs = jobs;
+    ctx.next_index = 0;
+    ctx.image_file = image_file;
+    ctx.errors = 0;
+    ctx.skipped = 0;
+    ctx.image_path = image_path;
+    pthread_mutex_init(&ctx.jobs_mutex, nullptr);
+    pthread_mutex_init(&ctx.image_mutex, nullptr);
+
+    size_t thread_count = jobs.size();
+    if (thread_count > 5) {
+        thread_count = 5;
+    }
+
+    printf("mode: %s\n", (thread_count > 1) ? "parallel" : "sequential");
+    printf("files order:\n");
+    for (const auto& job : jobs) {
+        printf("- %s\n", job.stored_name.c_str());
+    }
+
+    // Запускаем потоки для параллельного добавления файлов
+    std::vector<pthread_t> threads(thread_count);
+    for (size_t i = 0; i < thread_count; ++i) {
+        pthread_create(&threads[i], nullptr, add_worker_thread, &ctx);
+    }
+
+    for (size_t i = 0; i < thread_count; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+
+    pthread_mutex_destroy(&ctx.jobs_mutex);
+    pthread_mutex_destroy(&ctx.image_mutex);
+    fclose(image_file);
+
+    size_t total = jobs.size();
+    size_t skipped = (ctx.skipped >= 0 && static_cast<size_t>(ctx.skipped) <= total) ? static_cast<size_t>(ctx.skipped) : 0;
+    size_t errors = (ctx.errors >= 0 && static_cast<size_t>(ctx.errors) <= total) ? static_cast<size_t>(ctx.errors) : 0;
+    size_t success = (total >= skipped + errors) ? (total - skipped - errors) : 0;
+    printf("written: %zu/%zu\n", success, total);
+    if (skipped > 0) {
+        printf("skipped: %zu\n", skipped);
+    }
+    return (ctx.errors == 0) ? 0 : 1;
 }
 
-static int process_one_file(const std::string& input_path, const std::string& output_path, size_t* written_bytes) {
-    FILE* input_file = fopen(input_path.c_str(), "rb");
-    if (!input_file) {
-        // Входной файл недоступен: задачу считаем неуспешной
+static int list_image(const std::string& image_path) {
+    // Чтение заголовков всех записей и сортировка по имени
+    FILE* image_file = fopen(image_path.c_str(), "rb");
+    if (!image_file) {
+        // Образ недоступен для чтения
+        return 1;
+    }
+
+    std::vector<ImageEntry> entries;
+
+    while (true) {
+        bool eof = false;
+        uint32_t file_len = 0;
+        if (!read_u32_le(image_file, &file_len, &eof)) {
+            if (eof) {
+                break;
+            }
+            // Нарушение формата заголовка
+            fclose(image_file);
+            return 1;
+        }
+
+        uint32_t name_len = 0;
+        if (!read_u32_le(image_file, &name_len, &eof) || eof) {
+            // Повреждено поле длины имени
+            fclose(image_file);
+            return 1;
+        }
+
+        unsigned char salt[16];
+        if (!read_exact(image_file, salt, sizeof(salt))) {
+            // Повреждены байты соли
+            fclose(image_file);
+            return 1;
+        }
+
+        if (name_len > 65535) {
+            // Защита от некорректной длины имени
+            fclose(image_file);
+            return 1;
+        }
+
+        std::string name(name_len, '\0');
+        if (!read_exact(image_file, &name[0], name_len)) {
+            // Повреждено поле имени файла
+            fclose(image_file);
+            return 1;
+        }
+
+        if (fseek(image_file, static_cast<long>(file_len), SEEK_CUR) != 0) {
+            // Не удалось пропустить тело файла
+            fclose(image_file);
+            return 1;
+        }
+
+        ImageEntry entry;
+        entry.name = name;
+        entry.size = file_len;
+        entries.push_back(entry);
+    }
+
+    fclose(image_file);
+
+    std::sort(entries.begin(), entries.end(), [](const ImageEntry& a, const ImageEntry& b) {
+        return a.name < b.name;
+    });
+
+    for (const auto& entry : entries) {
+        printf("%s %u\n", entry.name.c_str(), entry.size);
+    }
+
+    return 0;
+}
+
+static int get_from_image(const std::string& image_path, const std::string& master_key, const std::string& output_path, const std::string& target_name) {
+    // Поиск записи в образе и расшифровка в указанный файл
+    if (set_master_key(reinterpret_cast<const unsigned char*>(master_key.data()), master_key.size()) != 0) {
+        // Некорректный мастер-ключ
+        return 1;
+    }
+
+    FILE* image_file = fopen(image_path.c_str(), "rb");
+    if (!image_file) {
+        // Не удалось открыть образ
         return 1;
     }
 
     FILE* output_file = fopen(output_path.c_str(), "wb");
     if (!output_file) {
-        fclose(input_file);
+        // Не удалось создать выходной файл
+        fclose(image_file);
         return 1;
     }
 
-    PipelineState state;
-    state.input_file = input_file;
-    state.output_file = output_file;
-    state.max_blocks = 4;  // Небольшой буфер между потоками: стабильный расход памяти
-    state.producer_done = false;
-    state.has_error = false;
-    state.bytes_written = 0;
-    pthread_mutex_init(&state.mutex, nullptr);
-    pthread_cond_init(&state.can_produce, nullptr);
-    pthread_cond_init(&state.can_consume, nullptr);
+    bool found = false;
 
-    pthread_t producer;
-    pthread_t consumer;
+    while (true) {
+        bool eof = false;
+        uint32_t file_len = 0;
+        if (!read_u32_le(image_file, &file_len, &eof)) {
+            // Конец файла или повреждение заголовка
+            break;
+        }
 
-    if (pthread_create(&producer, nullptr, producer_thread, &state) != 0) {
-        fclose(input_file);
-        fclose(output_file);
-        pthread_mutex_destroy(&state.mutex);
-        pthread_cond_destroy(&state.can_produce);
-        pthread_cond_destroy(&state.can_consume);
-        return 1;
+        uint32_t name_len = 0;
+        if (!read_u32_le(image_file, &name_len, &eof) || eof) {
+            // Повреждено поле длины имени
+            break;
+        }
+
+        unsigned char salt[16];
+        if (!read_exact(image_file, salt, sizeof(salt))) {
+            // Повреждены байты соли
+            break;
+        }
+
+        if (name_len > 65535) {
+            // Защита от некорректной длины имени
+            break;
+        }
+
+        std::string name(name_len, '\0');
+        if (!read_exact(image_file, &name[0], name_len)) {
+            // Повреждено поле имени файла
+            break;
+        }
+
+        if (name == target_name) {
+            if (rc4_crypt_stream(image_file, output_file, salt, sizeof(salt), file_len) != 0) {
+                // Ошибка расшифровки потока
+                fclose(image_file);
+                fclose(output_file);
+                remove(output_path.c_str());
+                return 1;
+            }
+            found = true;
+            break;
+        }
+
+        if (fseek(image_file, static_cast<long>(file_len), SEEK_CUR) != 0) {
+            // Не удалось пропустить тело файла
+            break;
+        }
     }
 
-    if (pthread_create(&consumer, nullptr, consumer_thread, &state) != 0) {
-        keep_running = 0;
-        pthread_join(producer, nullptr);
-        fclose(input_file);
-        fclose(output_file);
-        pthread_mutex_destroy(&state.mutex);
-        pthread_cond_destroy(&state.can_produce);
-        pthread_cond_destroy(&state.can_consume);
-        return 1;
-    }
-
-    pthread_join(producer, nullptr);
-    pthread_join(consumer, nullptr);
-
-    fclose(input_file);
+    fclose(image_file);
     fclose(output_file);
-    pthread_mutex_destroy(&state.mutex);
-    pthread_cond_destroy(&state.can_produce);
-    pthread_cond_destroy(&state.can_consume);
 
-    if (!keep_running) {
-        remove(output_path.c_str());  // Удаляем битый выходной файл при Ctrl+C
-        return 130;
-    }
-
-    if (state.has_error) {
-        remove(output_path.c_str());  // Удаляем неполный файл при ошибке пайплайна
+    if (!found) {
+        // Указанного файла нет в образе
+        remove(output_path.c_str());
         return 1;
     }
 
-    *written_bytes = state.bytes_written;  // Сколько реально записали по этой задаче
     return 0;
 }
 
-struct WorkerTask {
-    std::string input_path;
-    std::string output_path;
-    int status;
-    size_t written_bytes;
-};
-
-static void* file_worker_thread(void* arg) {
-    WorkerTask* task = static_cast<WorkerTask*>(arg);
-    log_line("Старт: " + task->input_path + " -> " + task->output_path);
-
-    task->status = process_one_file(task->input_path, task->output_path, &task->written_bytes);  // Один worker обрабатывает одну пару in/out
-
-    if (lock_with_timeout(&g_stats_mutex, 300)) {
-        if (task->status == 0) {
-            g_stats.completed++;
-            g_stats.bytes_written += task->written_bytes;
-        } else if (task->status == 130) {
-            g_stats.interrupted++;
-        } else {
-            g_stats.failed++;
-        }
-        pthread_mutex_unlock(&g_stats_mutex);
-    } else {
-        fprintf(stderr, "[WARN] Таймаут захвата stats_mutex\n");
-    }
-
-    if (task->status == 0) {
-        log_line("Готово: " + task->output_path);
-    } else if (task->status == 130) {
-        log_line("Прервано: " + task->output_path);
-    } else {
-        log_line("Ошибка: " + task->output_path);
-    }
-
-    return nullptr;
-}
-
-static void print_usage(const char* prog) {
-    fprintf(stderr, "Одиночный режим: %s <входной_файл> <выходной_файл> <ключ>\n", prog);
-    fprintf(stderr, "Многопоточный режим: %s <ключ> <in1> <out1> <in2> <out2> ...\n", prog);
+static void print_usage(const char* prog) { // инструкция, выводится когда нет выбранного режима (-add, -list, -get); переданы неизвестные опции; не хватает обязательных параметров для выбранного режима.
+    fprintf(stderr, "Добавление в образ: %s -add -key <секрет> -image <image> <file/dir> ...\n", prog);
+    fprintf(stderr, "Список файлов: %s -list -image <image>\n", prog);
+    fprintf(stderr, "Извлечение файла: %s -get -image <image> -key <секрет> -out <file> <name>\n", prog);
 }
 
 int main(int argc, char* argv[]) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_sigint;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, nullptr);
+    struct sigaction sa_segv; // настраиваем обработчик сигнала SIGSEGV для защиты страницы ключа от несанкционированного доступа, чтобы при попытке доступа к странице ключа программа не раскрывала содержимое ключа и завершалась безопасным образом, предотвращая утечку ключа при ошибках доступа к памяти
+    memset(&sa_segv, 0, sizeof(sa_segv)); // обнуляем структуру sigaction чтобы корректно работал обработчик
+    sa_segv.sa_sigaction = handle_sigsegv; // устанавливаем handler
+    sigemptyset(&sa_segv.sa_mask); // очищаем маску сигналов, чтобы не блокировать другие сигналы при обработке SIGSEGV, sigemptyset - инициализация маски сигналов, которая используется для указания, какие сигналы должны быть заблокированы во время выполнения обработчика, в данном случае мы не блокируем никакие сигналы
+    sa_segv.sa_flags = SA_SIGINFO; // указываем, что обработчик будет использовать расширенную информацию о сигнале, которая передается в виде аргумента siginfo_t*, чтобы мы могли определить, был ли доступ к странице ключа при возникновении SIGSEGV
+    sigaction(SIGSEGV, &sa_segv, nullptr); // устанавливаем обработчикконкретно для сигнала SIGSEGV
 
-    char key = 0;
-    std::vector<WorkerTask> tasks;
+    bool add_mode = false;
+    bool list_mode = false;
+    bool get_mode = false;
+    std::string image_path;
+    std::string master_key;
+    std::string output_path;
+    std::string target_name;
+    std::vector<std::string> inputs;
 
-    if (argc == 4) {  // смотрим на количесво аргументов строки - один файл
-        if (!parse_key(argv[3], &key)) {
-            fprintf(stderr, "Ошибка: ключ должен быть 1 символом или числом 0..255\n");
+    for (int i = 1; i < argc; ++i) {
+        // Разбор CLI для работы с образом
+        const char* arg = argv[i];
+        if (strcmp(arg, "-add") == 0) {
+            add_mode = true;
+        } else if (strcmp(arg, "-list") == 0) {
+            list_mode = true;
+        } else if (strcmp(arg, "-get") == 0) {
+            get_mode = true;
+        } else if (strcmp(arg, "-image") == 0 && i + 1 < argc) {
+            image_path = argv[++i];
+        } else if (strcmp(arg, "-key") == 0 && i + 1 < argc) {
+            master_key = argv[++i];
+        } else if (strcmp(arg, "-out") == 0 && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if (arg[0] == '-') {
+            // Неизвестная опция
+            print_usage(argv[0]); // выводим подсказку что вводиь
             return 1;
+        } else {
+            if (get_mode) {
+                target_name = arg; // в режиме извлечения последний аргумент - это имя файла внутри образа, который нужно извлечь, сохраняем его для последующего поиска в образе
+            } else {
+                inputs.push_back(arg); // в режиме добавления все аргументы после опций - это файлы или директории, которые нужно добавить в образ, сохраняем их в список для последующей обработки и добавления в образ
+            }
         }
-        WorkerTask task;
-        task.input_path = argv[1];
-        task.output_path = argv[2];
-        task.status = 1;
-        task.written_bytes = 0;
-        tasks.push_back(task);
-    } else if (argc >= 6 && (argc % 2 == 0)) {  // несколько файлов
-        if (!parse_key(argv[1], &key)) {
-            fprintf(stderr, "Ошибка: ключ должен быть 1 символом или числом 0..255\n");
-            return 1;
-        }
-        for (int i = 2; i < argc; i += 2) {
-            WorkerTask task;
-            task.input_path = argv[i];
-            task.output_path = argv[i + 1];
-            task.status = 1;
-            task.written_bytes = 0;
-            tasks.push_back(task);
-        }
-    } else {
-        print_usage(argv[0]);
+    }
+
+    if (!add_mode && !list_mode && !get_mode) {
+        print_usage(argv[0]); // если не выбран режим работы
         return 1;
     }
 
-    set_key(key);  // Один ключ применяется ко всем файлам текущего запуска
-
-    pthread_mutex_init(&g_log_mutex, nullptr);
-    pthread_mutex_init(&g_stats_mutex, nullptr);
-    g_log_file = fopen("secure_copy.log", "a");
-
-    g_stats.total_files = tasks.size();
-    g_stats.completed = 0;
-    g_stats.failed = 0;
-    g_stats.interrupted = 0;
-    g_stats.bytes_written = 0;
-    // Общая статистика по всем worker-потокам
-
-    log_line("Запуск secure_copy");
-
-    std::vector<pthread_t> workers(tasks.size());  // По одному worker-потоку на файл (параллельная обработка)
-    std::vector<bool> worker_created(tasks.size(), false);
-
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        if (pthread_create(&workers[i], nullptr, file_worker_thread, &tasks[i]) == 0) {
-            worker_created[i] = true;
-        } else {
-            tasks[i].status = 1;
-            // При ошибке старта потока учитываем задачу как failed
-            if (lock_with_timeout(&g_stats_mutex, 300)) {
-                g_stats.failed++;
-                pthread_mutex_unlock(&g_stats_mutex);
-            }
-            log_line("Ошибка создания потока задачи");
+    // Новый режим работы с образом
+    if (add_mode) {
+        if (image_path.empty() || master_key.empty() || inputs.empty()) {
+            print_usage(argv[0]);
+            return 1;
         }
+        int result = add_to_image(image_path, master_key, inputs);
+        clear_key();
+        return result;
     }
 
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        if (worker_created[i]) {
-            pthread_join(workers[i], nullptr);  // Корректное завершение всех потоков
+    if (list_mode) {
+        if (image_path.empty()) {
+            print_usage(argv[0]);
+            return 1;
         }
-    }
-    // Здесь все worker-потоки уже завершены
-
-    if (!keep_running) {
-        printf("Операция прервана пользователем\n");
+        int result = list_image(image_path);
+        clear_key();
+        return result;
     }
 
-    printf("Файлов всего: %zu\n", g_stats.total_files);
-    printf("Успешно: %zu\n", g_stats.completed);
-    printf("С ошибкой: %zu\n", g_stats.failed);
-    printf("Прервано: %zu\n", g_stats.interrupted);
-    printf("Записано байт: %zu\n", g_stats.bytes_written);
-
-    log_line("Завершение secure_copy");
-
-    if (g_log_file) {
-        fclose(g_log_file);
-        g_log_file = nullptr;
+    if (get_mode) {
+        if (image_path.empty() || master_key.empty() || output_path.empty() || target_name.empty()) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        int result = get_from_image(image_path, master_key, output_path, target_name);
+        clear_key();
+        return result;
     }
-    pthread_mutex_destroy(&g_log_mutex);
-    pthread_mutex_destroy(&g_stats_mutex);
 
-    clear_key(); // Затираем и освобождаем память с ключом перед выходом
-
-    if (!keep_running) {
-        // Возвращаем стандартный код прерывания по Ctrl+C
-        return 130;
-    }
-    return (g_stats.failed == 0) ? 0 : 1;  // 0 если нет ошибок, иначе 1
+    print_usage(argv[0]);
+    return 1;
 }
